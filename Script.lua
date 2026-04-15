@@ -1,11 +1,22 @@
-local db_url = "https://github.com/kyrayy/Adopt-Me-Script/blob/main/DataBase.lua"
-local whitelist = loadstring(game:HttpGet(db_url))()
+local db_url = "https://raw.githubusercontent.com/kyrayy/Adopt-Me-Script/refs/heads/main/DataBase.lua"
 
-if whitelist[game.Players.LocalPlayer.UserId] then
-    print("Доступ разрешен!")
-    
-    game.Players.LocalPlayer.Character.Humanoid.WalkSpeed = 50
-    
+
+local success, result = pcall(function()
+    return loadstring(game:HttpGet(db_url))()
+end)
+
+if success and result then
+    local whitelist = result
+    local userId = game.Players.LocalPlayer.UserId
+
+    if whitelist[userId] then
+        print("Доступ разрешен!")
+        
+        local character = game.Players.LocalPlayer.Character or game.Players.LocalPlayer.CharacterAdded:Wait()
+        character:WaitForChild("Humanoid").WalkSpeed = 50
+    else
+        game.Players.LocalPlayer:Kick("Тебя нет в вайтлисте!")
+    end
 else
-    game.Players.LocalPlayer:Kick("Тебя нет в вайтлисте!")
+    warn("Ошибка загрузки базы данных: " .. tostring(result))
 end
