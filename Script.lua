@@ -12,8 +12,8 @@ if success and result then
     if whitelist[userId] then
         print("Доступ разрешен!")
         
-        local character = game.Players.LocalPlayer.Character or game.Players.LocalPlayer.CharacterAdded:Wait()
-        character:WaitForChild("Humanoid").WalkSpeed = 50
+        ---------сюда скрипт--------
+
     else
         game.Players.LocalPlayer:Kick("Тебя нет в вайтлисте!")
     end
