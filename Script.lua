@@ -1,4 +1,4 @@
-local db_url = "https://github.com/kyrayy/Adopt-Me-Script/blob/main/DataBase.lua"
+local db_url = "https://githubusercontent.com/kyrayy/Adopt-Me-Script/blob/main/DataBase.lua"
 local whitelist = loadstring(game:HttpGet(db_url))()
 
 if whitelist[game.Players.LocalPlayer.UserId] then
