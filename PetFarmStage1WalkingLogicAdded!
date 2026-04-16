@@ -1,0 +1,778 @@
+--[[
+	ClientAilmentInteraction.lua
+
+	This script handles all client-side logic for interacting with ailments, including:
+	1. Detecting and prompting for nearby furniture interaction.
+	2. Automatically handling impending ailments (e.g., teleporting to a location and activating furniture).
+	3. Sending requests to the server to fulfill the ailment.
+	4. Creating and managing the UI display for both active and impending ailments.
+
+	This is a companion script to the Ailments UI script and should be placed in StarterPlayerScripts.
+--]]
+
+-- --- SERVICES ---
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local workspace = game:GetService("Workspace")
+
+-- --- REQUIRED MODULES ---
+local AilmentsManager = require(ReplicatedStorage.new.modules.Ailments.AilmentsClient)
+local ClientDataModule = require(ReplicatedStorage.ClientModules.Core.ClientData)
+local InteriorsM = require(ReplicatedStorage.ClientModules.Core.InteriorsM.InteriorsM)
+
+-- --- REMOTE FUNCTIONS / EVENTS (Assumed to exist on the server) ---
+-- This script now uses the InvokeServer method from the specified API service.
+local ActivateFurnitureAPI = ReplicatedStorage:WaitForChild("API", 10):WaitForChild("HousingAPI/ActivateFurniture", 10)
+local HoldBabyAPI = ReplicatedStorage:WaitForChild("API", 10):WaitForChild("AdoptAPI/HoldBaby", 10)
+
+-- --- CONFIGURATION ---
+local INTERACTION_DISTANCE = 10 -- How close the player needs to be to interact with furniture
+local INTERACTION_KEY = Enum.KeyCode.E
+local WARNING_THRESHOLD_SECONDS = 120 -- Warn if ailment will complete within 2 minutes
+
+-- This map directly links the ailment name to the exact furniture name in your world.
+local AilmentFurnitureMap = {
+	["sleepy"] = "BasicCrib",
+	["hungry"] = "PetFoodBowl",
+	["thirsty"] = "PetWaterBowl",
+	["dirty"] = "CheapPetBathtub",
+	["toilet"] = "Toilet",
+	["walk"] = "Walk",
+	["ride"] = "Ride"
+}
+
+-- --- DATA ---
+local LocalPlayer = Players.LocalPlayer
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+local activatedFurniture = {}
+local currentWalkPlatform = nil
+local isWalking = false
+
+-- Stores UI elements for active ailments:
+-- { [entityUniqueKey] = { [ailmentId] = { AilmentInstance = ailmentInstance, UiLabel = textLabel, EntityRef = entityRef, StoredAilmentId = ailmentId } } }
+local activeAilmentUIs = {}
+-- Stores UI labels for impending ailments:
+-- { [entityUniqueKey] = { [ailmentId] = TextLabel } }
+local impendingAilmentUIs = {}
+
+-- --- UI SETUP (ALL DONE BY SCRIPT) ---
+local AilmentDisplayGui
+local AilmentListFrame
+local AilmentItemTemplate
+local ImpendingAilmentsFrame -- New frame for impending ailments
+local WarningScrollingFrame -- Making this global
+local PromptGui
+local PromptLabel
+
+local function createAilmentUI()
+	local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+	-- Interaction Prompt UI
+	PromptGui = Instance.new("ScreenGui")
+	PromptGui.Name = "InteractionPromptGui"
+	PromptGui.ResetOnSpawn = false
+	PromptGui.Parent = PlayerGui
+
+	PromptLabel = Instance.new("TextLabel")
+	PromptLabel.Name = "InteractionPromptLabel"
+	PromptLabel.Size = UDim2.new(0, 200, 0, 30)
+	PromptLabel.Position = UDim2.new(0.5, -100, 0.8, 0)
+	PromptLabel.BackgroundTransparency = 0.5
+	PromptLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	PromptLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	PromptLabel.Text = "Press E to Interact"
+	PromptLabel.Font = Enum.Font.ArialBold
+	PromptLabel.TextScaled = true
+	PromptLabel.TextWrapped = true
+	PromptLabel.Visible = false
+	PromptLabel.Parent = PromptGui
+
+	-- ScreenGui for Ailment Display
+	AilmentDisplayGui = Instance.new("ScreenGui")
+	AilmentDisplayGui.Name = "AilmentDisplayGui"
+	AilmentDisplayGui.ResetOnSpawn = false
+	AilmentDisplayGui.Parent = PlayerGui
+
+	-- ScrollingFrame for ACTIVE AILMENTS
+	local ScrollingFrame = Instance.new("ScrollingFrame")
+	ScrollingFrame.Name = "ActiveAilmentScrollingFrame"
+	ScrollingFrame.Size = UDim2.new(0.3, 0, 0.5, 0)
+	ScrollingFrame.Position = UDim2.new(0.01, 0, 0.01, 0)
+	ScrollingFrame.BackgroundTransparency = 0.5
+	ScrollingFrame.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+	ScrollingFrame.BorderSizePixel = 1
+	ScrollingFrame.BorderColor3 = Color3.fromRGB(20, 20, 20)
+	ScrollingFrame.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 100)
+	ScrollingFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+	ScrollingFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	ScrollingFrame.ScrollingDirection = Enum.ScrollingDirection.Y
+	ScrollingFrame.Parent = AilmentDisplayGui
+	AilmentListFrame = ScrollingFrame
+
+	-- UIListLayout for ACTIVE AILMENTS
+	local ListLayout = Instance.new("UIListLayout")
+	ListLayout.Name = "ActiveAilmentListLayout"
+	ListLayout.Padding = UDim.new(0, 5)
+	ListLayout.FillDirection = Enum.FillDirection.Vertical
+	ListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	ListLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+	ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	ListLayout.Parent = AilmentListFrame
+
+	-- TextLabel Template for ACTIVE AILMENTS
+	AilmentItemTemplate = Instance.new("TextLabel")
+	AilmentItemTemplate.Name = "AilmentItemTemplate"
+	AilmentItemTemplate.Size = UDim2.new(1, -10, 0, 25)
+	AilmentItemTemplate.LayoutOrder = 0
+	AilmentItemTemplate.BackgroundTransparency = 1
+	AilmentItemTemplate.TextScaled = true
+	AilmentItemTemplate.TextWrapped = true
+	AilmentItemTemplate.TextXAlignment = Enum.TextXAlignment.Left
+	AilmentItemTemplate.TextYAlignment = Enum.TextYAlignment.Center
+	AilmentItemTemplate.Font = Enum.Font.Arial
+	AilmentItemTemplate.TextColor3 = Color3.fromRGB(255, 255, 255)
+	AilmentItemTemplate.TextStrokeTransparency = 0
+	AilmentItemTemplate.Visible = false
+	AilmentItemTemplate.Parent = AilmentListFrame
+
+	-- NEW UI FOR IMPENDING AILMENTS
+	ImpendingAilmentsFrame = Instance.new("Frame")
+	ImpendingAilmentsFrame.Name = "ImpendingAilmentsFrame"
+	ImpendingAilmentsFrame.Size = UDim2.new(0.3, 0, 0.2, 0)
+	ImpendingAilmentsFrame.Position = UDim2.new(0.01, 0, 0.55, 0)
+	ImpendingAilmentsFrame.BackgroundTransparency = 0.7
+	ImpendingAilmentsFrame.BackgroundColor3 = Color3.fromRGB(80, 50, 50)
+	ImpendingAilmentsFrame.BorderSizePixel = 1
+	ImpendingAilmentsFrame.BorderColor3 = Color3.fromRGB(40, 20, 20)
+	ImpendingAilmentsFrame.Parent = AilmentDisplayGui
+	ImpendingAilmentsFrame.Visible = false
+
+	local HeaderLabel = Instance.new("TextLabel")
+	HeaderLabel.Name = "Header"
+	HeaderLabel.Size = UDim2.new(1, 0, 0, 20)
+	HeaderLabel.Text = "Impending Ailments"
+	HeaderLabel.Font = Enum.Font.ArialBold
+	HeaderLabel.TextScaled = true
+	HeaderLabel.TextColor3 = Color3.fromRGB(255, 200, 200)
+	HeaderLabel.BackgroundTransparency = 1
+	HeaderLabel.Parent = ImpendingAilmentsFrame
+
+	WarningScrollingFrame = Instance.new("ScrollingFrame")
+	WarningScrollingFrame.Name = "WarningScrollingFrame"
+	WarningScrollingFrame.Size = UDim2.new(1, 0, 1, -20)
+	WarningScrollingFrame.Position = UDim2.new(0, 0, 0, 20)
+	WarningScrollingFrame.BackgroundTransparency = 1
+	WarningScrollingFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+	WarningScrollingFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	WarningScrollingFrame.ScrollingDirection = Enum.ScrollingDirection.Y
+	WarningScrollingFrame.Parent = ImpendingAilmentsFrame
+
+	local ImpendingAilmentsListLayout = Instance.new("UIListLayout")
+	ImpendingAilmentsListLayout.Name = "ImpendingAilmentsListLayout"
+	ImpendingAilmentsListLayout.Padding = UDim.new(0, 3)
+	ImpendingAilmentsListLayout.FillDirection = Enum.FillDirection.Vertical
+	ImpendingAilmentsListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	ImpendingAilmentsListLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+	ImpendingAilmentsListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	ImpendingAilmentsListLayout.Parent = WarningScrollingFrame
+end
+
+-- --- HELPER FUNCTIONS ---
+
+-- Function to get the entity reference for the player's baby or a pet
+local function getEntityReference(isPet, petUniqueId)
+	return {
+		player = LocalPlayer,
+		is_pet = isPet,
+		pet_unique = petUniqueId
+	}
+end
+
+-- This function now correctly uses 'kind' to get the ailment name
+local function getAilmentIdFromInstance(ailmentInstance)
+	if not ailmentInstance or type(ailmentInstance) ~= "table" then
+		return "UNKNOWN_INSTANCE"
+	end
+	if ailmentInstance.kind then
+		return tostring(ailmentInstance.kind)
+	end
+	return "UNKNOWN_AILMENT_NAME_FALLBACK"
+end
+
+local function formatAilmentDetails(ailmentInstance)
+	local details = {}
+	if ailmentInstance and type(ailmentInstance) == "table" then
+		if type(ailmentInstance.get_progress) == "function" then
+			table.insert(details, "Progress: " .. string.format("%.2f", ailmentInstance:get_progress()))
+		elseif ailmentInstance.progress then
+			table.insert(details, "Progress: " .. string.format("%.2f", ailmentInstance.progress))
+		end
+	end
+	if #details > 0 then
+		return " (" .. table.concat(details, ", ") .. ")"
+	else
+		return ""
+	end
+end
+
+-- Function to get a display name for the entity (LocalPlayer's baby/self or pet)
+local function getEntityDisplayInfo(entityRef)
+	if not entityRef then return "Unknown Entity", "N/A" end
+	if not entityRef.is_pet then
+		return LocalPlayer.Name .. "'s Baby", tostring(LocalPlayer.UserId)
+	else
+		-- When getting display info for a pet, we'll try to use its actual data.
+		local myInventory = ClientDataModule.get("inventory")
+		if myInventory and myInventory.pets and myInventory.pets[entityRef.pet_unique] then
+			return tostring(myInventory.pets[entityRef.pet_unique].id), tostring(entityRef.pet_unique)
+		else
+			return "Pet (Unknown Name)", tostring(entityRef.pet_unique)
+		end
+	end
+end
+
+-- Formats a time in seconds into a human-readable string (e.g., "1m 30s")
+local function formatTimeRemaining(seconds)
+	if not seconds or seconds < 0 then return "N/A" end
+	local minutes = math.floor(seconds / 60)
+	local remainingSeconds = math.floor(seconds % 60)
+	if minutes > 0 then
+		return string.format("%dm %02ds", minutes, remainingSeconds)
+	else
+		return string.format("%ds", remainingSeconds)
+	end
+end
+
+-- This function finds the closest furniture that can treat an ailment by checking for the correct name
+local function findTreatableFurniture()
+	local closestFurniture = nil
+	local closestDistance = math.huge
+	local furnitureFolder = workspace:WaitForChild("HouseInteriors", 10):FindFirstChild("furniture")
+	if not furnitureFolder then
+		return nil, nil
+	end
+
+	-- Check for treatable ailments for the player's baby
+	local playerAilments = AilmentsManager.get_ailments_for_pet(getEntityReference(false))
+	for _, ailmentInstance in pairs(playerAilments or {}) do
+		local furnitureName = AilmentFurnitureMap[ailmentInstance.kind]
+		if furnitureName then
+			local furniture = furnitureFolder:FindFirstChild(furnitureName)
+			if furniture then
+				local distance = (HumanoidRootPart.Position - furniture.Position).Magnitude
+				if distance <= INTERACTION_DISTANCE and distance < closestDistance then
+					closestFurniture = furniture
+					closestDistance = distance
+				end
+			end
+		end
+	end
+
+	-- Check for treatable ailments for all pets
+	local myInventory = ClientDataModule.get("inventory")
+	if myInventory and myInventory.pets then
+		for petUniqueId, _ in pairs(myInventory.pets) do
+			local petAilments = AilmentsManager.get_ailments_for_pet(getEntityReference(true, petUniqueId))
+			for _, ailmentInstance in pairs(petAilments or {}) do
+				local furnitureName = AilmentFurnitureMap[ailmentInstance.kind]
+				if furnitureName then
+					local furniture = furnitureFolder:FindFirstChild(furnitureName)
+					if furniture then
+						local distance = (HumanoidRootPart.Position - furniture.Position).Magnitude
+						if distance <= INTERACTION_DISTANCE and distance < closestDistance then
+							closestFurniture = furniture
+							closestDistance = distance
+						end
+					end
+				end
+			end
+		end
+	end
+	
+	return closestFurniture
+end
+
+local function hasTreatableAilment(furnitureName)
+	local treatableAilment = nil
+	local treatingEntityRef = nil
+	local ailmentKindFromFurniture = nil
+
+	-- Reverse lookup to find the ailment kind from the furniture name
+	for ailmentKind, name in pairs(AilmentFurnitureMap) do
+		if name == furnitureName then
+			ailmentKindFromFurniture = ailmentKind
+			break
+		end
+	end
+
+	if not ailmentKindFromFurniture then return nil, nil end
+
+	-- Check local player's baby ailments
+	local playerAilments = AilmentsManager.get_ailments_for_pet(getEntityReference(false))
+	for _, ailmentInstance in pairs(playerAilments or {}) do
+		if ailmentInstance.kind == ailmentKindFromFurniture then
+			treatableAilment = ailmentInstance
+			treatingEntityRef = getEntityReference(false)
+			break
+		end
+	end
+
+	-- If no baby ailment found, check pet ailments
+	if not treatableAilment then
+		local myInventory = ClientDataModule.get("inventory")
+		if myInventory and myInventory.pets then
+			for petUniqueId, _ in pairs(myInventory.pets) do
+				local petAilments = AilmentsManager.get_ailments_for_pet(getEntityReference(true, petUniqueId))
+				for _, ailmentInstance in pairs(petAilments or {}) do
+					if ailmentInstance.kind == ailmentKindFromFurniture then
+						treatableAilment = ailmentInstance
+						treatingEntityRef = getEntityReference(true, petUniqueId)
+						break
+					end
+				end
+			end
+		end
+	end
+	
+	return treatableAilment, treatingEntityRef
+end
+
+-- This function now finds and returns the first pet model it can find in the Workspace.Pets folder.
+local function findFirstPetModel()
+	local petsFolder = workspace:WaitForChild("Pets", 10)
+	if not petsFolder then
+		warn("Pets folder not found in workspace.")
+		return nil
+	end
+
+	for _, child in ipairs(petsFolder:GetChildren()) do
+		if child:IsA("Model") then
+			warn("Found pet model:", child.Name)
+			return child
+		end
+	end
+
+	warn("Could not find any pet model in workspace.Pets.")
+	return nil
+end
+
+local function startWalkLogic(ailmentInstance, entityRef)
+	-- Find the pet model
+	local petModel = findFirstPetModel()
+	if not petModel then
+		warn("Could not find a pet model to hold.")
+		return
+	end
+	
+	-- Create a platform far away
+	currentWalkPlatform = Instance.new("Part")
+	currentWalkPlatform.Size = Vector3.new(20, 1, 20)
+	currentWalkPlatform.CFrame = CFrame.new(0, 1000, 0)
+	currentWalkPlatform.Anchored = true
+	currentWalkPlatform.CanCollide = true
+	currentWalkPlatform.Transparency = 1
+	currentWalkPlatform.Name = "WalkAilmentPlatform"
+	currentWalkPlatform.Parent = workspace
+	
+	if Character and HumanoidRootPart and Character:FindFirstChildOfClass("Humanoid") then
+		print("Teleporting local player and pet to walk platform...")
+		
+		-- Teleport the player's character to the platform (this is client-side)
+		Character:SetPrimaryPartCFrame(currentWalkPlatform.CFrame * CFrame.new(0, 5, 0))
+
+		-- Tell the server to have the player hold the pet
+		local args = {
+			petModel,
+		}
+		HoldBabyAPI:FireServer(unpack(args))
+		
+		-- Loop indefinitely until the ailment is no longer present on the entity
+		task.spawn(function()
+			while AilmentsManager.get_ailments_for_pet(entityRef) and AilmentsManager.get_ailments_for_pet(entityRef)["walk"] do
+				-- Use ChangeState to force the humanoid to jump, which is more reliable than setting Jump = true
+				Character.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+				print("Attempting to make the player jump.")
+				task.wait(0.5) -- Wait a little before the next jump
+			end
+			-- Clean up once the loop ends
+			if currentWalkPlatform and currentWalkPlatform.Parent then
+				currentWalkPlatform:Destroy()
+				currentWalkPlatform = nil
+			end
+			
+			-- Inform the server that the walk is complete and the player should stop holding the pet
+			ActivateFurnitureAPI:InvokeServer(nil, "walk_end", nil, entityRef)
+			-- Unhold the pet
+			local args = {
+				petModel,
+			}
+			HoldBabyAPI:FireServer(unpack(args)) -- Firing the event with the pet again should unhold
+		end)
+		
+		-- Tell the server the walk has started
+		ActivateFurnitureAPI:InvokeServer(nil, "walk_action", nil, entityRef)
+	else
+		warn("Could not find player's Character, HumanoidRootPart, or Humanoid.")
+		if currentWalkPlatform then
+			currentWalkPlatform:Destroy()
+			currentWalkPlatform = nil
+		end
+	end
+end
+
+local function handleAilmentFulfillment(ailmentInstance, entityRef)
+	local ailmentId = ailmentInstance.kind
+	local entityUniqueKey = entityRef.is_pet and entityRef.pet_unique or tostring(LocalPlayer.UserId)
+	local key = entityUniqueKey .. ":" .. ailmentId
+
+	if activatedFurniture[key] then
+		print("Furniture already activated for this ailment, skipping.")
+		return
+	end
+
+	local furnitureToFind = AilmentFurnitureMap[ailmentId]
+	if not furnitureToFind then
+		print("No furniture mapping found for ailment:", ailmentId)
+		return
+	end
+	
+	-- Handle the special "ride" case
+	if ailmentId == "ride" then
+		local petToHold = findFirstPetModel()
+		if petToHold then
+			local args = {
+				petToHold,
+			}
+			HoldBabyAPI:FireServer(unpack(args))
+		end
+		return
+	end
+
+	-- Handle the special "walk" case, which requires a custom client-side action
+	if ailmentId == "walk" then
+		print("Executing walk logic for " .. (entityRef.is_pet and "pet" or "player") .. "...")
+		startWalkLogic(ailmentInstance, entityRef)
+		return
+	end
+
+	-- Handle normal furniture activation
+	local furnitureFolder = workspace:WaitForChild("HouseInteriors", 10):FindFirstChild("furniture")
+	if not furnitureFolder then
+		warn("HouseInteriors.furniture folder not found.")
+		return
+	end
+
+	-- Find the furniture by name
+	local foundItem = furnitureFolder:FindFirstChild(furnitureToFind)
+	
+	if foundItem then
+		local actionType = "UseBlock"
+		if furnitureToFind == "Toilet" or furnitureToFind == "BasicCrib" then
+			actionType = "Seat1"
+		end
+
+		local petToUse = nil
+		if entityRef.is_pet then
+			petToUse = findFirstPetModel()
+			if not petToUse then
+				warn("Could not find pet model for furniture activation.")
+				return
+			end
+		end
+
+		if ActivateFurnitureAPI then
+			local folderName = furnitureFolder.Name
+			local playerHead = LocalPlayer.Character:WaitForChild("Head", 10)
+			if not playerHead then
+				warn("Player's head not found.")
+				return
+			end
+			local headCFrame = playerHead.CFrame
+
+			local args = {
+				LocalPlayer,
+				folderName,
+				actionType,
+				{
+					cframe = headCFrame,
+				},
+				petToUse,
+			}
+			ActivateFurnitureAPI:InvokeServer(unpack(args))
+			activatedFurniture[key] = true
+			print("API call activated for " .. foundItem.Name .. ".")
+		end
+	end
+end
+
+-- --- UI MANAGEMENT FUNCTIONS ---
+
+local function addAilmentToUI(ailmentInstance, entityUniqueKey, entityRef)
+	local ailmentId = getAilmentIdFromInstance(ailmentInstance)
+	local entityDisplayName, entityUniqueIdForDisplay = getEntityDisplayInfo(entityRef)
+
+	if not activeAilmentUIs[entityUniqueKey] then
+		activeAilmentUIs[entityUniqueKey] = {}
+	end
+
+	if not activeAilmentUIs[entityUniqueKey][ailmentId] then
+		local ailmentLabel = AilmentItemTemplate:Clone()
+		ailmentLabel.Name = ailmentId .. "_" .. entityUniqueKey:sub(1, math.min(string.len(entityUniqueKey), 8))
+		local displayString = ""
+		if entityRef.is_pet then
+			displayString = string.format("%s (%s) - %s%s", entityDisplayName, entityUniqueIdForDisplay, ailmentId, formatAilmentDetails(ailmentInstance))
+		else
+			displayString = string.format("%s - %s%s", entityDisplayName, ailmentId, formatAilmentDetails(ailmentInstance))
+		end
+		ailmentLabel.Text = displayString
+
+		ailmentLabel.LayoutOrder = os.time() + math.random() / 1000
+		ailmentLabel.Visible = true
+		ailmentLabel.Parent = AilmentListFrame
+
+		activeAilmentUIs[entityUniqueKey][ailmentId] = {
+			AilmentInstance = ailmentInstance,
+			UiLabel = ailmentLabel,
+			EntityRef = entityRef,
+			StoredAilmentId = ailmentId
+		}
+		print(string.format("[UI Add] Added Ailment: %s for %s (%s)", ailmentId, entityDisplayName, entityUniqueIdForDisplay))
+	else
+		local existingEntry = activeAilmentUIs[entityUniqueKey][ailmentId]
+		existingEntry.AilmentInstance = ailmentInstance
+		existingEntry.EntityRef = entityRef
+		local displayString = ""
+		if entityRef.is_pet then
+			displayString = string.format("%s (%s) - %s%s", entityDisplayName, entityUniqueIdForDisplay, ailmentId, formatAilmentDetails(ailmentInstance))
+		else
+			displayString = string.format("%s - %s%s", entityDisplayName, ailmentId, formatAilmentDetails(ailmentInstance))
+		end
+		existingEntry.UiLabel.Text = displayString
+		print(string.format("[UI Update] Updated Ailment: %s for %s (%s)", ailmentId, entityDisplayName, entityUniqueIdForDisplay))
+	end
+end
+
+local function removeAilmentFromUI(ailmentInstance, entityUniqueKey, entityRef)
+	local ailmentIdToRemove = getAilmentIdFromInstance(ailmentInstance)
+	local foundEntry = activeAilmentUIs[entityUniqueKey] and activeAilmentUIs[entityUniqueKey][ailmentIdToRemove]
+
+	if not foundEntry then
+		for currentAilmentId, entry in pairs(activeAilmentUIs[entityUniqueKey] or {}) do
+			if entry.AilmentInstance == ailmentInstance then
+				ailmentIdToRemove = currentAilmentId
+				foundEntry = entry
+				break
+			end
+		end
+	end
+
+	if foundEntry then
+		local uiLabel = foundEntry.UiLabel
+		local storedAilmentId = foundEntry.StoredAilmentId
+		uiLabel:Destroy()
+		activeAilmentUIs[entityUniqueKey][storedAilmentId] = nil
+		if next(activeAilmentUIs[entityUniqueKey]) == nil then
+			activeAilmentUIs[entityUniqueKey] = nil
+		end
+		local entityDisplayName, entityUniqueIdForDisplay = getEntityDisplayInfo(entityRef)
+		print(string.format("[UI Remove] Removed Ailment: %s for %s (%s)", storedAilmentId, entityDisplayName, entityUniqueIdForDisplay))
+	else
+		print(string.format("[UI Remove] Could not find Ailment UI to remove: %s for %s (Key attempted: %s)", ailmentIdToRemove, entityUniqueKey, ailmentIdToRemove))
+	end
+
+	if impendingAilmentUIs[entityUniqueKey] and impendingAilmentUIs[entityUniqueKey][ailmentIdToRemove] then
+		impendingAilmentUIs[entityUniqueKey][ailmentIdToRemove]:Destroy()
+		impendingAilmentUIs[entityUniqueKey][ailmentIdToRemove] = nil
+		if next(impendingAilmentUIs[entityUniqueKey]) == nil then
+			impendingAilmentUIs[entityUniqueKey] = nil
+		end
+	end
+end
+
+-- --- INITIAL SCAN & EVENT CONNECTIONS ---
+
+local function initialAilmentUIScan()
+	print("Performing initial UI population for ailments.")
+	for entityKey, ailmentMap in pairs(activeAilmentUIs) do
+		for ailmentId, entry in pairs(ailmentMap) do
+			if entry.UiLabel and entry.UiLabel.Parent then
+				entry.UiLabel:Destroy()
+			end
+		end
+	end
+	activeAilmentUIs = {}
+	for entityKey, ailmentMap in pairs(impendingAilmentUIs) do
+		for ailmentId, label in pairs(ailmentMap) do
+			if label and label.Parent then
+				label:Destroy()
+			end
+		end
+	end
+	impendingAilmentUIs = {}
+
+	local localPlayerEntity = getEntityReference(false)
+	local localPlayerAilments = AilmentsManager.get_ailments_for_pet(localPlayerEntity)
+	if localPlayerAilments then
+		for _, ailmentInstance in pairs(localPlayerAilments) do
+			addAilmentToUI(ailmentInstance, tostring(LocalPlayer.UserId), localPlayerEntity)
+		end
+	end
+
+	local myInventory = ClientDataModule.get("inventory")
+	if myInventory and myInventory.pets then
+		for petUniqueId, petData in pairs(myInventory.pets) do
+			local petEntityRef = getEntityReference(true, petUniqueId)
+			local petAilments = AilmentsManager.get_ailments_for_pet(petEntityRef)
+			if petAilments then
+				for _, ailmentInstance in pairs(petAilments) do
+					addAilmentToUI(ailmentInstance, petUniqueId, petEntityRef)
+					-- Check for "walk" ailment and handle it immediately on script start
+					if ailmentInstance.kind == "walk" then
+						handleAilmentFulfillment(ailmentInstance, petEntityRef)
+					end
+				end
+			end
+		end
+	end
+	print("Initial UI population complete.")
+end
+
+-- --- MAIN LOOP AND INPUT HANDLING ---
+
+-- Heartbeat loop to continuously check for nearby furniture and show prompts
+local lastCheckTime = 0
+local closestFurniture = nil
+RunService.Heartbeat:Connect(function()
+	if not Character or not HumanoidRootPart or not HumanoidRootPart.Parent then return end
+
+	local currentTime = tick()
+	if currentTime - lastCheckTime >= 0.1 then
+		lastCheckTime = currentTime
+		closestFurniture = findTreatableFurniture()
+		PromptLabel.Visible = closestFurniture ~= nil
+	end
+
+	-- Logic for updating UI and checking for impending warnings (runs every second)
+	local lastUpdateTime = 0
+	if os.time() - lastUpdateTime < 1 then return end
+	lastUpdateTime = os.time()
+	local warningsFound = false
+	for entityUniqueKey, ailmentMap in pairs(activeAilmentUIs) do
+		for ailmentId, entry in pairs(ailmentMap) do
+			local ailmentInstance = entry.AilmentInstance
+			local uiLabel = entry.UiLabel
+			local entityRef = entry.EntityRef
+			local entityDisplayName, entityUniqueIdForDisplay = getEntityDisplayInfo(entityRef)
+			local displayString = ""
+			if entityRef.is_pet then
+				displayString = string.format("%s (%s) - %s%s", entityDisplayName, entityUniqueIdForDisplay, ailmentId, formatAilmentDetails(ailmentInstance))
+			else
+				displayString = string.format("%s - %s%s", entityDisplayName, ailmentId, formatAilmentDetails(ailmentInstance))
+			end
+			uiLabel.Text = displayString
+
+			local rateFinishedTimestamp = ailmentInstance:get_rate_finished_timestamp()
+			if rateFinishedTimestamp then
+				local timeLeftSeconds = rateFinishedTimestamp - workspace:GetServerTimeNow()
+				if timeLeftSeconds > 0 and timeLeftSeconds <= WARNING_THRESHOLD_SECONDS then
+					warningsFound = true
+					if not impendingAilmentUIs[entityUniqueKey] then
+						impendingAilmentUIs[entityUniqueKey] = {}
+					end
+					local warningLabel = impendingAilmentUIs[entityUniqueKey][ailmentId]
+					if not warningLabel then
+						warningLabel = Instance.new("TextLabel")
+						warningLabel.Name = "Impending_" .. ailmentId .. "_" .. entityUniqueKey:sub(1, math.min(string.len(entityUniqueKey), 8))
+						warningLabel.Size = UDim2.new(1, -10, 0, 20)
+						warningLabel.LayoutOrder = os.time() + math.random() / 1000
+						warningLabel.BackgroundTransparency = 1
+						warningLabel.TextScaled = true
+						warningLabel.TextWrapped = true
+						warningLabel.TextXAlignment = Enum.TextXAlignment.Left
+						warningLabel.TextYAlignment = Enum.TextYAlignment.Center
+						warningLabel.Font = Enum.Font.Arial
+						warningLabel.TextColor3 = Color3.fromRGB(255, 150, 150)
+						warningLabel.TextStrokeTransparency = 0
+						warningLabel.Parent = WarningScrollingFrame
+						impendingAilmentUIs[entityUniqueKey][ailmentId] = warningLabel
+					end
+					local warningText = ""
+					if entityRef.is_pet then
+						warningText = string.format("%s (%s) - %s in %s", entityDisplayName, entityUniqueIdForDisplay, ailmentId, formatTimeRemaining(timeLeftSeconds))
+					else
+						warningText = string.format("%s - %s in %s", entityDisplayName, ailmentId, formatTimeRemaining(timeLeftSeconds))
+					end
+					warningLabel.Text = warningText
+					warningLabel.Visible = true
+				else
+					if impendingAilmentUIs[entityUniqueKey] and impendingAilmentUIs[entityUniqueKey][ailmentId] then
+						impendingAilmentUIs[entityUniqueKey][ailmentId]:Destroy()
+						impendingAilmentUIs[entityUniqueKey][ailmentId] = nil
+						if next(impendingAilmentUIs[entityUniqueKey]) == nil then
+							impendingAilmentUIs[entityUniqueKey] = nil
+						end
+					end
+				end
+			else
+				if impendingAilmentUIs[entityUniqueKey] and impendingAilmentUIs[entityUniqueKey][ailmentId] then
+					impendingAilmentUIs[entityUniqueKey][ailmentId]:Destroy()
+					impendingAilmentUIs[entityUniqueKey][ailmentId] = nil
+					if next(impendingAilmentUIs[entityUniqueKey]) == nil then
+						impendingAilmentUIs[entityUniqueKey] = nil
+					end
+				end
+			end
+		end
+	end
+	ImpendingAilmentsFrame.Visible = warningsFound
+end)
+
+-- Handles player input (e.g., pressing 'E')
+UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+	if gameProcessedEvent then return end
+	if input.KeyCode == INTERACTION_KEY and closestFurniture then
+		local ailmentInstance, entityRef = hasTreatableAilment(closestFurniture.Name)
+		if ailmentInstance and entityRef then
+			handleAilmentFulfillment(ailmentInstance, entityRef)
+		end
+	end
+end)
+
+-- Listens for new ailments and attempts to fulfill them automatically and adds to UI
+AilmentsManager.get_ailment_created_signal():Connect(function(ailmentInstance, entityUniqueKey)
+	local isPet = string.len(entityUniqueKey) > 10
+	local entityRef = getEntityReference(isPet, entityUniqueKey)
+	addAilmentToUI(ailmentInstance, entityUniqueKey, entityRef)
+	if ailmentInstance.kind == "walk" then
+		handleAilmentFulfillment(ailmentInstance, entityRef)
+	end
+end)
+
+AilmentsManager.get_ailment_completed_signal():Connect(function(ailmentInstance, entityUniqueKey, completionReason)
+	local isPet = string.len(entityUniqueKey) > 10
+	local entityRef = getEntityReference(isPet, entityUniqueKey)
+	removeAilmentFromUI(ailmentInstance, entityUniqueKey, entityRef)
+	local entityDisplayName, entityUniqueIdForDisplay = getEntityDisplayInfo(entityRef)
+	print(string.format("[Event] Ailment COMPLETED for %s ('%s'): '%s' (Reason: %s)",
+		entityDisplayName,
+		entityUniqueIdForDisplay,
+		getAilmentIdFromInstance(ailmentInstance),
+		tostring(completionReason)
+	))
+end)
+
+-- --- STARTUP EXECUTION ---
+task.spawn(function()
+	print("Ailments Manager UI: Script started. Creating UI...")
+	createAilmentUI()
+	print("Ailments Manager UI: UI created. Waiting for modules and data...")
+	task.wait(5)
+	print("Ailments Manager UI: Modules and data ready. Starting initial scan.")
+	initialAilmentUIScan()
+end)
+
+print("Ailment Interaction Logic Script Started.")
